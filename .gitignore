@@ -1,0 +1,4 @@
+*.swp
+/.deps
+/pg_metrics.o
+/pg_metrics.so

@@ -1,0 +1,4 @@
+comment = 'pg_metrics'
+default_version = '1.0'
+
+relocatable = true

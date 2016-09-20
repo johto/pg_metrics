@@ -94,11 +94,11 @@ pgmet_counter_add(PG_FUNCTION_ARGS)
 	volatile pgmetMetricData *metric;
 	int64 prev;
 
-	if (VARSIZE(metric_name) > MAXMETRICSNAMELEN)
+	if (VARSIZE(metric_name) - VARHDRSZ > MAXMETRICSNAMELEN)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("metric name must not be longer than 127 characters in length")));
+				 errmsg("the name of the metric must not be longer than 127 characters in length")));
 	}
 
 	if (!pgmet)

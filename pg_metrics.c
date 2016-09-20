@@ -10,6 +10,8 @@
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 #include "utils/guc.h"
+#include "utils/syscache.h"
+#include "utils/lsyscache.h"
 
 #define MAXMETRICSNAMELEN		127
 
@@ -63,10 +65,13 @@ typedef struct pgmetSharedEntry
 
 extern Datum pgmet_counter_add(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(pgmet_counter_add);
+extern Datum pgmet_metrics(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(pgmet_metrics);
 
 extern void _PG_init(void);
 extern void _PG_fini(void);
 
+static pgmetMetricData *pgmet_find_metric(pgmetSharedHashKey *key);
 static pgmetMetricData *pgmet_upsert_metric(const char *name, pgmetMetricType type);
 static void pgmet_shmem_startup(void);
 static uint32 pgmet_shared_hash_fn(const void *key, Size keysize);
@@ -117,30 +122,139 @@ pgmet_counter_add(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(prev);
 }
 
+extern Datum
+pgmet_metrics(PG_FUNCTION_ARGS)
+{
+	int					i;
+	int					num_metrics;
+	HASH_SEQ_STATUS		hash_seq;
+	pgmetSharedEntry   *entry;
+	pgmetMetricData	  **metrics;
+	char			  **metric_names;
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc			tupdesc;
+	Tuplestorestate	   *tupstore;
+	MemoryContext		oldcxt;
+
+	Oid					ext_namespace;
+	Oid					enum_oid;
+
+	/* check to see if caller supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not " \
+						"allowed in this context")));
+
+	ext_namespace = get_func_namespace(fcinfo->flinfo->fn_oid);
+	enum_oid = GetSysCacheOid2(TYPENAMENSP,
+							   CStringGetDatum("metric_type"),
+							   ObjectIdGetDatum(ext_namespace));
+
+	/* switch to long-lived memory context */
+	oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+
+	tupstore = tuplestore_begin_heap(rsinfo->allowedModes & SFRM_Materialize_Random,
+									 false, work_mem);
+
+	/* get the requested return tuple description */
+	tupdesc = CreateTupleDescCopy(rsinfo->expectedDesc);
+	if (tupdesc->natts != 3)
+		elog(ERROR, "unexpected natts %d", tupdesc->natts);
+
+	LWLockAcquire(pgmet->lock, LW_SHARED);
+
+	num_metrics = hash_get_num_entries(pgmet_shared_hash);
+	metrics = (pgmetMetricData **) palloc(sizeof(pgmetMetricData *) * num_metrics);
+	metric_names = (char **) palloc(sizeof(char *) * num_metrics);
+
+	hash_seq_init(&hash_seq, pgmet_shared_hash);
+	i = 0;
+	while ((entry = hash_seq_search(&hash_seq)) != NULL)
+	{
+		Assert(num_metrics > i);
+		metrics[i] = &entry->metric_data;
+		metric_names[i] = entry->metric_name;
+		++i;
+	}
+	Assert(num_metrics == i);
+
+	LWLockRelease(pgmet->lock);
+
+	for (i = 0; i < num_metrics; ++i)
+	{
+		volatile pgmetMetricData *metric;
+		int64 value;
+		Datum values[3];
+		bool isnull[3] = { false, false, false };
+
+		Assert(metric->type == PGMET_METRICTYPE_COUNTER);
+
+		metric = metrics[i];
+		SpinLockAcquire(&metric->mutex);
+		value = metric->value;
+		SpinLockRelease(&metric->mutex);
+
+		values[0] = CStringGetTextDatum(metric_names[i]);
+		values[1] = DirectFunctionCall2(enum_in,
+										CStringGetDatum("COUNTER"),
+										enum_oid);
+		values[2] = Int64GetDatum(value);
+		tuplestore_putvalues(tupstore, tupdesc, values, isnull);
+	}
+
+	MemoryContextSwitchTo(oldcxt);
+
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+
+	return (Datum) 0;
+}
+
+static pgmetMetricData *
+pgmet_find_metric(pgmetSharedHashKey *key)
+{
+	pgmetSharedEntry   *entry;
+
+	Assert(pgmet != NULL);
+
+	/* Lookup the hash table entry with shared lock. */
+	LWLockAcquire(pgmet->lock, LW_SHARED);
+
+	entry = (pgmetSharedEntry *) hash_search(pgmet_shared_hash, key, HASH_FIND, NULL);
+	LWLockRelease(pgmet->lock);
+	if (entry)
+		return &entry->metric_data;
+	else
+		return NULL;
+}
+
 static pgmetMetricData *
 pgmet_upsert_metric(const char *name, pgmetMetricType type)
 {
 	pgmetSharedHashKey	key;
 	pgmetSharedEntry   *entry;
 	bool				found;
+	pgmetMetricData	   *metric;
 
 	Assert(pgmet != NULL);
 
 	key.name_ptr = name;
 	key.name_len = strlen(name);
 
-	/* Lookup the hash table entry with shared lock. */
-	LWLockAcquire(pgmet->lock, LW_SHARED);
-
-	entry = (pgmetSharedEntry *) hash_search(pgmet_shared_hash, &key, HASH_FIND, NULL);
-	if (entry)
+	metric = pgmet_find_metric(&key);
+	if (metric != NULL)
 	{
-		LWLockRelease(pgmet->lock);
-		return &entry->metric_data;
+		/* TODO: check type */
+		return metric;
 	}
 
 	/* Must acquire exclusive lock to add a new entry. */
-	LWLockRelease(pgmet->lock);
 	LWLockAcquire(pgmet->lock, LW_EXCLUSIVE);
 	if (hash_get_num_entries(pgmet_shared_hash) >= pgmet_max)
 	{

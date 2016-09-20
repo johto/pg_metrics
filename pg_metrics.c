@@ -11,6 +11,8 @@
 #include "utils/hsearch.h"
 #include "utils/guc.h"
 
+#define MAXMETRICSNAMELEN		127
+
 
 PG_MODULE_MAGIC;
 
@@ -82,10 +84,17 @@ static HTAB *pgmet_shared_hash = NULL;
 Datum
 pgmet_counter_add(PG_FUNCTION_ARGS)
 {
-	Name metric_name = PG_GETARG_NAME(0);
+	text *metric_name = PG_GETARG_TEXT_PP(0);
 	int64 increment = PG_GETARG_INT64(1);
 	volatile pgmetMetricData *metric;
 	int64 prev;
+
+	if (VARSIZE(metric_name) > MAXMETRICSNAMELEN)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("metric name must not be longer than 127 characters in length")));
+	}
 
 	if (!pgmet)
 	{
@@ -93,7 +102,7 @@ pgmet_counter_add(PG_FUNCTION_ARGS)
 		PG_RETURN_NULL();
 	}
 
-	metric = pgmet_upsert_metric(NameStr(*metric_name), PGMET_METRICTYPE_COUNTER);
+	metric = pgmet_upsert_metric(text_to_cstring(metric_name), PGMET_METRICTYPE_COUNTER);
 	if (!metric)
 	{
 		/* couldn't whatever or whatever */
@@ -231,8 +240,8 @@ pgmet_shmem_startup(void)
 	}
 
 	memset(&info, 0, sizeof(info));
-	info.keysize = NAMEDATALEN;
-	info.entrysize = offsetof(pgmetSharedEntry, metric_name) + NAMEDATALEN;
+	info.keysize = MAXMETRICSNAMELEN + 1;
+	info.entrysize = offsetof(pgmetSharedEntry, metric_name) + MAXMETRICSNAMELEN + 1;
 	info.hash = pgmet_shared_hash_fn;
 	info.match = pgmet_shared_match_fn;
 	pgmet_shared_hash = ShmemInitHash("pg_metrics hash",
@@ -282,7 +291,7 @@ pgmet_memsize(void)
 	Size		entrysize;
 
 	size = MAXALIGN(sizeof(pgmetSharedState));
-	entrysize = offsetof(pgmetSharedEntry, metric_name) + NAMEDATALEN;
+	entrysize = offsetof(pgmetSharedEntry, metric_name) + MAXMETRICSNAMELEN + 1;
 	size = add_size(size, hash_estimate_size(pgmet_max, entrysize));
 
 	return size;

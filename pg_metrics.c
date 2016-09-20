@@ -98,7 +98,7 @@ pgmet_counter_add(PG_FUNCTION_ARGS)
 	{
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("the name of the metric must not be longer than 127 characters in length")));
+				 errmsg("the name of the metric must be no longer than 127 bytes in length")));
 	}
 
 	if (!pgmet)

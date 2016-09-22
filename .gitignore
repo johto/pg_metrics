@@ -2,3 +2,5 @@
 /.deps
 /pg_metrics.o
 /pg_metrics.so
+/prometheus_exporter/prometheus_exporter
+/prometheus_exporter/vendor/*

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 )
 
 type PGMetricsCollector struct {
@@ -20,6 +19,9 @@ type PGMetricsCollector struct {
 
 	fetchQuery string
 	metrics map[string]PGMetric
+	statsMetrics []*prometheus.Desc
+
+	refreshMetricListRequest chan<- struct{}
 }
 
 type PGMetric struct {
@@ -43,14 +45,15 @@ func (c *PGMetricsCollector) fetchMetrics(populateDescs bool) map[string]PGMetri
 
 	rows, err := c.dbh.Query(c.fetchQuery)
 	if err != nil {
-		c.elog.Fatal(err)
+		c.elog.Fatalf("ERROR:  %s", err)
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var metric PGMetric
 
 		err = rows.Scan(&metric.Name, &metric.Type, &metric.CounterValue)
 		if err != nil {
-			c.elog.Fatal(err)
+			c.elog.Fatalf("ERROR:  %s", err)
 		}
 		if populateDescs {
 			metric.Desc = prometheus.NewDesc(
@@ -63,23 +66,41 @@ func (c *PGMetricsCollector) fetchMetrics(populateDescs bool) map[string]PGMetri
 		metrics[metric.Name] = metric
 	}
 	if rows.Err() != nil {
-		c.elog.Fatal(rows.Err())
+		c.elog.Fatalf("ERROR:  %s", rows.Err())
 	}
 	return metrics
 }
 
 func (c *PGMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
+	for _, desc := range c.statsMetrics {
+		ch <- desc
+	}
 	for _, metric := range c.metrics {
 		ch <- metric.Desc
 	}
 }
 
+func (c *PGMetricsCollector) fetchStats() (maxMetrics int32, numMetrics int32) {
+	statsQuery := fmt.Sprintf(`SELECT max_metrics, num_metrics FROM %s.metrics_stats()`, pq.QuoteIdentifier(c.schemaName))
+	err := c.dbh.QueryRow(statsQuery).Scan(&maxMetrics, &numMetrics)
+	if err != nil {
+		c.elog.Fatalf("ERROR:  %s", err)
+	}
+	return maxMetrics, numMetrics
+}
+
+
 func (c *PGMetricsCollector) Collect(ch chan<- prometheus.Metric) {
+	maxMetrics, numMetrics := c.fetchStats()
+	ch <- prometheus.MustNewConstMetric(c.statsMetrics[0], prometheus.GaugeValue, float64(maxMetrics))
+	ch <- prometheus.MustNewConstMetric(c.statsMetrics[1], prometheus.GaugeValue, float64(numMetrics))
+
 	metrics := c.fetchMetrics(SKIP_DESCS)
+	needRefresh := false
 	for _, metric := range metrics {
 		x, exists := c.metrics[metric.Name]
 		if !exists {
-			//
+			needRefresh = true
 			continue
 		}
 		desc := x.Desc
@@ -91,9 +112,16 @@ func (c *PGMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 			panic(fmt.Sprintf("unexpected metric type %s", metric.Type))
 		}
 	}
+
+	if needRefresh {
+		select {
+			case c.refreshMetricListRequest <- struct{}{}:
+			default:
+		}
+	}
 }
 
-func newPGMetricsCollector(elog *log.Logger, dbh *sql.DB, schemaName string) *PGMetricsCollector {
+func newPGMetricsCollector(elog *log.Logger, dbh *sql.DB, schemaName string, refreshMetricListRequest chan<- struct{}) *PGMetricsCollector {
 	fetchQuery := fmt.Sprintf(
 		`SELECT ` +
 		`metric_name, metric_type, counter_value ` +
@@ -105,57 +133,38 @@ func newPGMetricsCollector(elog *log.Logger, dbh *sql.DB, schemaName string) *PG
 		dbh: dbh,
 		schemaName: schemaName,
 		fetchQuery: fetchQuery,
+		refreshMetricListRequest: refreshMetricListRequest,
 	}
 	c.metrics = c.fetchMetrics(POPULATE_DESCS)
+	c.statsMetrics = []*prometheus.Desc{
+		prometheus.NewDesc(
+			"max_metrics",
+			"tu-turu",
+			nil,
+			nil,
+		),
+		prometheus.NewDesc(
+			"num_metrics",
+			"tu-turu",
+			nil,
+			nil,
+		),
+	}
+
 	return c
 }
 
-// Maintains the list of 
-func metricsCollectorCollector(elog *log.Logger, dbh *sql.DB, schemaName string, registry *prometheus.Registry) {
-	currentMetrics := make(map[string]string)
-	currentCollector := prometheus.Collector(nil)
-	collectQuery := fmt.Sprintf(`SELECT metric_name, metric_type FROM %s.metrics()`, pq.QuoteIdentifier(schemaName))
+func metricsListUpdaterLoop(elog *log.Logger, dbh *sql.DB, schemaName string, registry *prometheus.Registry) {
 	for {
-		newMetrics := make(map[string]string)
-
-		rows, err := dbh.Query(collectQuery)
+		refreshMetricListRequest := make(chan struct{}, 1)
+		collector := newPGMetricsCollector(elog, dbh, schemaName, refreshMetricListRequest)
+		err := registry.Register(collector)
 		if err != nil {
-			elog.Fatal(err)
+			elog.Fatalf("ERROR:  %s", err)
 		}
-		for rows.Next() {
-			var name string
-			var typ string
-
-			err = rows.Scan(&name, &typ)
-			if err != nil {
-				elog.Fatal(err)
-			}
-			newMetrics[name] = typ
-		}
-		if rows.Err() != nil {
-			elog.Fatal(rows.Err())
-		}
-
-		haveNewMetrics := false
-		if currentCollector == nil {
-			haveNewMetrics = true
-		} else {
-			for key := range newMetrics {
-				_, exists := currentMetrics[key]
-				if !exists {
-					haveNewMetrics = true
-					break
-				}
-			}
-		}
-		if haveNewMetrics {
-			if currentCollector != nil {
-				registry.Unregister(currentCollector)
-			}
-			currentCollector = newPGMetricsCollector(elog, dbh, schemaName)
-			registry.Register(currentCollector)
-		}
-		time.Sleep(47 * time.Second)
+		<-refreshMetricListRequest
+		elog.Printf("Refreshing the list of metrics")
+		registry.Unregister(collector)
 	}
 }
 
@@ -183,8 +192,5 @@ func main() {
 		elog.Fatal(http.ListenAndServe(":8080", nil))
 	}()
 
-	go metricsCollectorCollector(elog, dbh, schemaName, registry)
-	//go metricsQuerier(dbh, schemaName)
-
-	select{}
+	metricsListUpdaterLoop(elog, dbh, schemaName, registry)
 }

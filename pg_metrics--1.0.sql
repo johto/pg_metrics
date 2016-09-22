@@ -15,3 +15,6 @@ CREATE FUNCTION metrics() RETURNS TABLE (
 	counter_value int8
 )
 AS 'pg_metrics', 'pgmet_metrics' LANGUAGE c STRICT;
+
+CREATE FUNCTION metrics_stats(OUT max_metrics int4, OUT num_metrics int4) RETURNS RECORD
+AS 'pg_metrics', 'pgmet_metrics_stats' LANGUAGE c STRICT;

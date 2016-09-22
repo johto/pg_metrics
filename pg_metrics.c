@@ -67,6 +67,9 @@ extern Datum pgmet_counter_add(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(pgmet_counter_add);
 extern Datum pgmet_metrics(PG_FUNCTION_ARGS);
 PG_FUNCTION_INFO_V1(pgmet_metrics);
+extern Datum pgmet_metrics_stats(PG_FUNCTION_ARGS);
+PG_FUNCTION_INFO_V1(pgmet_metrics_stats);
+
 
 extern void _PG_init(void);
 extern void _PG_fini(void);
@@ -214,6 +217,32 @@ pgmet_metrics(PG_FUNCTION_ARGS)
 	rsinfo->setDesc = tupdesc;
 
 	return (Datum) 0;
+}
+
+extern Datum
+pgmet_metrics_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		isnull[2] = { false, false };
+	int			num_metrics;
+
+	if (pgmet == NULL)
+		PG_RETURN_NULL();
+
+	LWLockAcquire(pgmet->lock, LW_SHARED);
+	num_metrics = hash_get_num_entries(pgmet_shared_hash);
+	LWLockRelease(pgmet->lock);
+
+	tupdesc = CreateTemplateTupleDesc(2, false);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 1, "max_metrics", INT4OID, -1, 0);
+	TupleDescInitEntry(tupdesc, (AttrNumber) 2, "num_metrics", INT4OID, -1, 0);
+	BlessTupleDesc(tupdesc);
+
+	values[0] = Int32GetDatum(pgmet_max);
+	values[1] = Int32GetDatum(num_metrics);
+
+	return HeapTupleGetDatum(heap_form_tuple(tupdesc, values, isnull));
 }
 
 static pgmetMetricData *
